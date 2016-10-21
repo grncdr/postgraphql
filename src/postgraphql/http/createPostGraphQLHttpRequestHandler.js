@@ -32,6 +32,13 @@ const favicon = new Promise((resolve, reject) => {
   })
 })
 
+const graphiqlJs = new Promise((resolve, reject) => {
+  readFile(resolvePath(__dirname, '../graphiql/graphiql.dist.js'), (error, data) => {
+    if (error) reject(error)
+    else resolve(data)
+  })
+})
+
 /**
  * Creates a GraphQL request handler, this is untyped besides some JSDoc types
  * for intellisense.
@@ -39,7 +46,7 @@ const favicon = new Promise((resolve, reject) => {
  * @param {GraphQLSchema} graphqlSchema
  */
 export default function createPostGraphQLHttpRequestHandler (options) {
-  const { getGqlSchema, pgPool } = options
+  const { getGqlSchema, pgPool, emitter } = options
 
   // Gets the route names for our GraphQL endpoint, and our GraphiQL endpoint.
   const graphqlRoute = options.graphqlRoute || '/graphql'
@@ -109,6 +116,58 @@ export default function createPostGraphQLHttpRequestHandler (options) {
       }
 
       res.end(await favicon)
+      return
+    }
+
+    // Serve the JavaScript for GraphiQL on a namespaced path
+    if (parseUrl(req).pathname === '/_postgraphql/graphiql.js') {
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'text/javascript')
+      res.end(await graphiqlJs)
+      return
+    }
+
+    // Setup an event stream so we can broadcast events to clients
+    if (parseUrl(req).pathname === '/_postgraphql/stream') {
+      if (req.headers.accept !== 'text/event-stream') {
+        res.end()
+        return
+      }
+
+      // Making sure this options are set
+      req.socket.setTimeout(0)
+      req.socket.setNoDelay(true)
+      req.socket.setKeepAlive(true)
+
+      // Set headers for Server-Side Events
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      })
+
+      // Expose function on response to write to the stream
+      res.sse = string => {
+        res.write(string)
+        // support running within the compression middleware
+        // https://github.com/expressjs/compression#server-sent-events
+        if (res.flushHeaders) res.flushHeaders()
+      }
+
+      // Notify client that connection is open
+      res.sse('event: open\n\n')
+
+      // Setup listeners
+      const schemaChangedCb = () => res.sse('event: changed\ndata: schema\n\n')
+      if (options.watchPg)
+        emitter.on('schemas:changed', schemaChangedCb)
+
+      // Clean up when connection closes
+      req.on('close', () => {
+        res.end()
+        emitter.removeListener('schemas:changed', schemaChangedCb)
+      })
+
       return
     }
 
